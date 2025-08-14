@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: reserva-sala
+    env: python
+    buildCommand: ""
+    startCommand: gunicorn app:app
+    envVars:
+      - key: SECRET_KEY
+        value: devkey-change-me
