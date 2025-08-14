@@ -1,12 +1,13 @@
 from datetime import datetime, date, timedelta, time
-import sqlite3
-import os
+import os, json
 from flask import Flask, request, redirect, url_for, make_response, render_template_string, flash, abort
 
 # --- App setup ---
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'devkey-change-me')
-DB_PATH = os.path.join(os.path.dirname(__file__), 'events.db')
+
+BASE_DIR = os.path.dirname(__file__)
+JSON_PATH = os.path.join(BASE_DIR, 'events.json')
 
 # Regras de negócio
 WORKDAY_START = time(9, 0)   # 09:00
@@ -15,30 +16,27 @@ WORKDAY_END   = time(17, 0)  # 17:00
 # (Opcional) token para assinatura ICS segmentada
 ICS_TOKEN = os.getenv("ICS_TOKEN")  # ex.: ICS_TOKEN=cliente123
 
-# --- DB helpers ---
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+# --- JSON helpers ---
+def _ensure_json():
+    if not os.path.exists(JSON_PATH):
+        with open(JSON_PATH, 'w', encoding='utf-8') as f:
+            json.dump({"events": []}, f, ensure_ascii=False, indent=2)
 
-def init_db():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            event_date TEXT NOT NULL,         -- YYYY-MM-DD
-            start_time TEXT NOT NULL,         -- HH:MM (24h)
-            end_time TEXT NOT NULL,           -- HH:MM (24h)
-            email TEXT NOT NULL,
-            created_at TEXT NOT NULL          -- ISO timestamp
-        );
-        """
-    )
-    conn.commit()
-    conn.close()
+def _read_all():
+    _ensure_json()
+    with open(JSON_PATH, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    data.setdefault("events", [])
+    return data
+
+def _write_all(data):
+    tmp = JSON_PATH + ".tmp"
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, JSON_PATH)
+
+def _next_id(events):
+    return (max((ev.get("id", 0) for ev in events), default=0) + 1)
 
 def parse_time(hhmm: str):
     return datetime.strptime(hhmm, "%H:%M").time()
@@ -70,21 +68,18 @@ def index():
     start_month = date(year, month, 1)
     next_month = (start_month.replace(day=28) + timedelta(days=4)).replace(day=1)
 
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT * FROM events
-        WHERE event_date >= ? AND event_date < ?
-        ORDER BY event_date, start_time
-        """,
-        (start_month.isoformat(), next_month.isoformat())
-    )
-    rows = cur.fetchall()
-    conn.close()
+    data = _read_all()
+    events = data["events"]
+
+    # Filtra mês
+    events_month = [
+        ev for ev in events
+        if start_month.isoformat() <= ev["event_date"] < next_month.isoformat()
+    ]
+    events_month.sort(key=lambda ev: (ev["event_date"], ev["start_time"]))
 
     events_by_day = {}
-    for r in rows:
+    for r in events_month:
         d = int(r["event_date"].split("-")[2])
         events_by_day.setdefault(d, []).append(r)
 
@@ -135,39 +130,97 @@ def add_event():
             flash(e, "error")
         return redirect(url_for("index"))
 
-    # Conflito: mesmo dia + sobreposição -> "Horário não disponível."
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT start_time, end_time FROM events WHERE event_date = ?", (event_date,))
-    existing = cur.fetchall()
-    for row in existing:
+    # Conflito: mesmo dia + sobreposição
+    data = _read_all()
+    events = data["events"]
+    same_day = [ev for ev in events if ev["event_date"] == event_date]
+    for row in same_day:
         if overlaps(parse_time(row["start_time"]), parse_time(row["end_time"]), st, et):
-            conn.close()
             flash("Horário não disponível.", "error")
             return redirect(url_for("index"))
 
     # Inserção
-    cur.execute(
-        """
-        INSERT INTO events (title, event_date, start_time, end_time, email, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (title, event_date, start_time, end_time, email, datetime.utcnow().isoformat())
-    )
-    conn.commit()
-    conn.close()
+    new_ev = {
+        "id": _next_id(events),
+        "title": title,
+        "event_date": event_date,
+        "start_time": start_time,
+        "end_time": end_time,
+        "email": email,
+        "created_at": datetime.utcnow().isoformat()
+    }
+    events.append(new_ev)
+    _write_all(data)
+
     flash("Evento reservado com sucesso!", "success")
     y, m, _ = event_date.split("-")
+    return redirect(url_for("index", year=int(y), month=int(m)))
+
+# --- Editar (alterar data/horários) ---
+@app.post("/edit/<int:event_id>")
+def edit_event(event_id: int):
+    email_req = (request.form.get("email") or "").strip().lower()
+    new_date = request.form.get("event_date")      # YYYY-MM-DD
+    new_start = request.form.get("start_time")     # HH:MM
+    new_end   = request.form.get("end_time")       # HH:MM
+
+    errors = []
+    try:
+        _ = datetime.strptime(new_date, "%Y-%m-%d").date()
+    except Exception:
+        errors.append("Data inválida.")
+    try:
+        st = parse_time(new_start)
+        et = parse_time(new_end)
+        if et <= st:
+            errors.append("Hora de término deve ser maior que a hora de início.")
+    except Exception:
+        errors.append("Horários inválidos.")
+        st = et = None
+
+    if st and et:
+        if st < WORKDAY_START or et > WORKDAY_END:
+            errors.append(f"Agendamentos permitidos apenas entre {WORKDAY_START.strftime('%H:%M')} e {WORKDAY_END.strftime('%H:%M')}.")
+
+    data = _read_all()
+    events = data["events"]
+    found = next((ev for ev in events if ev["id"] == event_id), None)
+
+    if not found:
+        flash("Evento não encontrado.", "error")
+        return redirect(url_for("index"))
+
+    if (found.get("email") or "").strip().lower() != email_req:
+        flash("Apenas quem criou o evento pode alterar (e-mail não confere).", "error")
+        return redirect(url_for("index"))
+
+    if errors:
+        for e in errors:
+            flash(e, "error")
+        return redirect(url_for("index"))
+
+    # Conflito no novo dia
+    same_day = [ev for ev in events if ev["event_date"] == new_date and ev["id"] != event_id]
+    for row in same_day:
+        if overlaps(parse_time(row["start_time"]), parse_time(row["end_time"]), st, et):
+            flash("Novo horário não disponível.", "error")
+            return redirect(url_for("index"))
+
+    # Aplicar alterações
+    found["event_date"] = new_date
+    found["start_time"] = new_start
+    found["end_time"]   = new_end
+    _write_all(data)
+
+    flash("Evento alterado com sucesso!", "success")
+    y, m, _ = new_date.split("-")
     return redirect(url_for("index", year=int(y), month=int(m)))
 
 # --- ICS export + endpoints para assinatura pelo Outlook ---
 @app.get("/export.ics")
 def export_ics():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM events ORDER BY event_date, start_time")
-    rows = cur.fetchall()
-    conn.close()
+    data = _read_all()
+    rows = sorted(data["events"], key=lambda ev: (ev["event_date"], ev["start_time"]))
 
     ics_lines = [
         "BEGIN:VCALENDAR",
@@ -213,29 +266,25 @@ def calendar_ics_token(token: str):
 def delete_event(event_id: int):
     email_req = (request.form.get("email") or "").strip().lower()
 
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT id, email FROM events WHERE id = ?", (event_id,))
-    row = cur.fetchone()
+    data = _read_all()
+    events = data["events"]
+    found = next((ev for ev in events if ev["id"] == event_id), None)
 
-    if not row:
-        conn.close()
+    if not found:
         flash("Evento não encontrado.", "error")
         return redirect(url_for("index"))
 
-    email_owner = (row["email"] or "").strip().lower()
+    email_owner = (found["email"] or "").strip().lower()
     if email_req != email_owner:
-        conn.close()
         flash("Apenas quem criou o evento pode excluir (e-mail não confere).", "error")
         return redirect(url_for("index"))
 
-    cur.execute("DELETE FROM events WHERE id = ?", (event_id,))
-    conn.commit()
-    conn.close()
+    data["events"] = [ev for ev in events if ev["id"] != event_id]
+    _write_all(data)
     flash("Evento excluído.", "success")
     return redirect(url_for("index"))
 
-# --- Template (paleta estilo Correios + crédito) ---
+# --- Template (paleta estilo Correios + crédito) + formulário de Alterar ---
 TEMPLATE_INDEX = r"""
 <!doctype html>
 <html lang="pt-br">
@@ -299,6 +348,12 @@ TEMPLATE_INDEX = r"""
     .muted{opacity:.6}
     form.inline{display:inline;}
     a.btnlink{text-decoration:none;}
+
+    details{margin-top:6px;}
+    details .editbox{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;}
+    details .editbox input{font-size:12px;padding:6px 8px;}
+    details .editbox button{padding:8px 10px;}
+    summary{cursor:pointer;user-select:none;}
   </style>
 </head>
 <body>
@@ -375,12 +430,26 @@ TEMPLATE_INDEX = r"""
                   <div class="event">
                     <div><strong>{{ ev['title'] }}</strong></div>
                     <div class="time">{{ ev['start_time'] }}–{{ ev['end_time'] }}</div>
+
+                    <!-- Excluir -->
                     <form class="inline" method="post" action="/delete/{{ ev['id'] }}" onsubmit="return confirm('Excluir este evento?');">
                       <input type="email" name="email" placeholder="Seu e-mail" required
                              style="border:1px solid var(--border); background:#FFF; color:var(--text);
                                     padding:6px 8px; border-radius:8px; font-size:12px; margin-right:6px; width:160px;">
                       <button type="submit" class="warn">Excluir</button>
                     </form>
+
+                    <!-- Alterar -->
+                    <details>
+                      <summary>Alterar</summary>
+                      <form class="editbox" method="post" action="/edit/{{ ev['id'] }}">
+                        <input type="email"   name="email"      placeholder="Seu e-mail (autor)" required>
+                        <input type="date"    name="event_date" value="{{ ev['event_date'] }}" required>
+                        <input type="time"    name="start_time" value="{{ ev['start_time'] }}" required>
+                        <input type="time"    name="end_time"   value="{{ ev['end_time'] }}" required>
+                        <button type="submit" class="primary">Salvar</button>
+                      </form>
+                    </details>
                   </div>
                 {% endfor %}
                 {% if not events_by_day.get(d) %}
@@ -405,5 +474,5 @@ TEMPLATE_INDEX = r"""
 """
 
 if __name__ == "__main__":
-    init_db()
+    _ensure_json()
     app.run(host="0.0.0.0", port=5000, debug=True)
