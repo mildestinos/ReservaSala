@@ -264,11 +264,12 @@ TEMPLATE_INDEX = r"""<!doctype html>
     button.warn{background:var(--warn);color:#111827;}
     input{border-radius:10px;border:1px solid var(--border);background:#FFF;color:var(--text);padding:10px 12px;font-size:14px;}
     input[type="date"],input[type="time"]{padding:8px 10px;}
-    .weekday{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:8px 0;}
+    .weekday{display:grid;grid-template-columns:repeat(7,1fr);text-align:center;
+             font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:8px 0;}
     .grid{display:grid;grid-template-columns:repeat(7,1fr);gap:8px;}
     .day{background:var(--panel);border:1px solid var(--border);border-radius:14px;min-height:120px;padding:8px;display:flex;flex-direction:column;}
     .day.today{outline:3px solid var(--today);outline-offset:1px;}
-    .day .head{display:flex;justify-content:space-between;align-items:center;font-size:12px;color:var(--muted);}
+    .day .head{display:flex;justify-content:flex-end;align-items:center;font-size:12px;color:var(--muted);}
     .day .num{font-weight:700;font-size:14px;color:var(--brand-blue);}
     .events{margin-top:6px;display:flex;flex-direction:column;gap:6px;overflow-y:auto}
     .event{background:var(--event-bg);border:1px solid var(--event-border);padding:6px 8px;border-radius:10px;font-size:12px;}
@@ -364,7 +365,18 @@ TEMPLATE_INDEX = r"""<!doctype html>
         Janela de agendamento: <strong>{{ wstart }}–{{ wend }}</strong>. Conflitos são bloqueados automaticamente.
       </div>
     </div>
-    <div class="weekday">Seg • Ter • Qua • Qui • Sex • Sáb • Dom</div>
+
+    <!-- Cabeçalho da semana -->
+    <div class="weekday">
+      <div>Seg</div>
+      <div>Ter</div>
+      <div>Qua</div>
+      <div>Qui</div>
+      <div>Sex</div>
+      <div>Sáb</div>
+      <div>Dom</div>
+    </div>
+
     <div class="grid">
       {% for week in weeks %}
         {% for d in week %}
@@ -377,7 +389,6 @@ TEMPLATE_INDEX = r"""<!doctype html>
             <div class="day {{ 'today' if is_today else '' }}">
               <div class="head">
                 <span class="num">{{ d }}</span>
-                <span class="muted">{{ ['Seg','Ter','Qua','Qui','Sex','Sáb','Dom'][(loop.index0)%7] }}</span>
               </div>
               <div class="events">
                 {% for ev in events_by_day.get(d, []) %}
