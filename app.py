@@ -1,22 +1,24 @@
 from datetime import datetime, date, timedelta, time
-import os, json
+import os, sys, json, calendar
 from flask import Flask, request, redirect, url_for, make_response, render_template_string, flash, abort
 
 # --- App setup ---
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'devkey-change-me')
 
-BASE_DIR = os.path.dirname(__file__)
+# --- Ajuste para persistência do JSON ---
+if getattr(sys, 'frozen', False):  # Executável
+    BASE_DIR = os.path.dirname(sys.executable)
+else:                               # Script Python
+    BASE_DIR = os.path.dirname(__file__)
+
 JSON_PATH = os.path.join(BASE_DIR, 'events.json')
+print(">>> JSON persistente em:", JSON_PATH)
 
 # Regras de negócio
 WORKDAY_START = time(9, 0)   # 09:00
 WORKDAY_END   = time(17, 0)  # 17:00
 
-# (Opcional) token para assinatura ICS segmentada
-ICS_TOKEN = os.getenv("ICS_TOKEN")  # ex.: ICS_TOKEN=cliente123
-
-# --- JSON helpers ---
 def _ensure_json():
     if not os.path.exists(JSON_PATH):
         with open(JSON_PATH, 'w', encoding='utf-8') as f:
@@ -42,11 +44,8 @@ def parse_time(hhmm: str):
     return datetime.strptime(hhmm, "%H:%M").time()
 
 def overlaps(a_start, a_end, b_start, b_end) -> bool:
-    # Interseção em intervalos [a_start, a_end) e [b_start, b_end)
     return (a_start < b_end) and (b_start < a_end)
 
-# --- Calendar generation ---
-import calendar
 calendar.setfirstweekday(calendar.MONDAY)
 
 def month_matrix(year: int, month: int):
@@ -71,7 +70,6 @@ def index():
     data = _read_all()
     events = data["events"]
 
-    # Filtra mês
     events_month = [
         ev for ev in events
         if start_month.isoformat() <= ev["event_date"] < next_month.isoformat()
@@ -96,9 +94,9 @@ def index():
 @app.post("/add")
 def add_event():
     title = (request.form.get("title") or "").strip()
-    event_date = request.form.get("event_date")  # YYYY-MM-DD
-    start_time = request.form.get("start_time")  # HH:MM
-    end_time = request.form.get("end_time")      # HH:MM
+    event_date = request.form.get("event_date")
+    start_time = request.form.get("start_time")
+    end_time = request.form.get("end_time")
     email = (request.form.get("email") or "").strip()
 
     errors = []
@@ -107,30 +105,28 @@ def add_event():
     try:
         _ = datetime.strptime(event_date, "%Y-%m-%d").date()
     except Exception:
-        errors.append("Data inválida (use o seletor de data).")
+        errors.append("Data inválida.")
     try:
         st = parse_time(start_time)
         et = parse_time(end_time)
         if et <= st:
-            errors.append("Hora de término deve ser maior que a hora de início.")
+            errors.append("Hora de término deve ser maior que a de início.")
     except Exception:
-        errors.append("Horários inválidos (use o seletor de hora).")
+        errors.append("Horários inválidos.")
         st = et = None
 
     if "@" not in email or "." not in email:
         errors.append("E-mail inválido.")
 
-    # Janela 09:00–17:00
     if st and et:
         if st < WORKDAY_START or et > WORKDAY_END:
-            errors.append(f"Agendamentos permitidos apenas entre {WORKDAY_START.strftime('%H:%M')} e {WORKDAY_END.strftime('%H:%M')}.")
+            errors.append(f"Agendamentos apenas entre {WORKDAY_START.strftime('%H:%M')} e {WORKDAY_END.strftime('%H:%M')}.")
 
     if errors:
         for e in errors:
             flash(e, "error")
         return redirect(url_for("index"))
 
-    # Conflito: mesmo dia + sobreposição
     data = _read_all()
     events = data["events"]
     same_day = [ev for ev in events if ev["event_date"] == event_date]
@@ -139,7 +135,6 @@ def add_event():
             flash("Horário não disponível.", "error")
             return redirect(url_for("index"))
 
-    # Inserção
     new_ev = {
         "id": _next_id(events),
         "title": title,
@@ -156,13 +151,12 @@ def add_event():
     y, m, _ = event_date.split("-")
     return redirect(url_for("index", year=int(y), month=int(m)))
 
-# --- Editar (alterar data/horários) ---
 @app.post("/edit/<int:event_id>")
 def edit_event(event_id: int):
     email_req = (request.form.get("email") or "").strip().lower()
-    new_date = request.form.get("event_date")      # YYYY-MM-DD
-    new_start = request.form.get("start_time")     # HH:MM
-    new_end   = request.form.get("end_time")       # HH:MM
+    new_date = request.form.get("event_date")
+    new_start = request.form.get("start_time")
+    new_end   = request.form.get("end_time")
 
     errors = []
     try:
@@ -173,14 +167,14 @@ def edit_event(event_id: int):
         st = parse_time(new_start)
         et = parse_time(new_end)
         if et <= st:
-            errors.append("Hora de término deve ser maior que a hora de início.")
+            errors.append("Hora de término deve ser maior que a de início.")
     except Exception:
         errors.append("Horários inválidos.")
         st = et = None
 
     if st and et:
         if st < WORKDAY_START or et > WORKDAY_END:
-            errors.append(f"Agendamentos permitidos apenas entre {WORKDAY_START.strftime('%H:%M')} e {WORKDAY_END.strftime('%H:%M')}.")
+            errors.append(f"Agendamentos apenas entre {WORKDAY_START.strftime('%H:%M')} e {WORKDAY_END.strftime('%H:%M')}.")
 
     data = _read_all()
     events = data["events"]
@@ -191,7 +185,7 @@ def edit_event(event_id: int):
         return redirect(url_for("index"))
 
     if (found.get("email") or "").strip().lower() != email_req:
-        flash("Apenas quem criou o evento pode alterar (e-mail não confere).", "error")
+        flash("E-mail não confere para edição.", "error")
         return redirect(url_for("index"))
 
     if errors:
@@ -199,14 +193,12 @@ def edit_event(event_id: int):
             flash(e, "error")
         return redirect(url_for("index"))
 
-    # Conflito no novo dia
     same_day = [ev for ev in events if ev["event_date"] == new_date and ev["id"] != event_id]
     for row in same_day:
         if overlaps(parse_time(row["start_time"]), parse_time(row["end_time"]), st, et):
             flash("Novo horário não disponível.", "error")
             return redirect(url_for("index"))
 
-    # Aplicar alterações
     found["event_date"] = new_date
     found["start_time"] = new_start
     found["end_time"]   = new_end
@@ -216,56 +208,9 @@ def edit_event(event_id: int):
     y, m, _ = new_date.split("-")
     return redirect(url_for("index", year=int(y), month=int(m)))
 
-# --- ICS export + endpoints para assinatura pelo Outlook ---
-@app.get("/export.ics")
-def export_ics():
-    data = _read_all()
-    rows = sorted(data["events"], key=lambda ev: (ev["event_date"], ev["start_time"]))
-
-    ics_lines = [
-        "BEGIN:VCALENDAR",
-        "VERSION:2.0",
-        "PRODID:-//Sala de Reunião//PT-BR//EN",
-    ]
-    for r in rows:
-        dt = datetime.strptime(r["event_date"], "%Y-%m-%d").date()
-        st = datetime.combine(dt, parse_time(r["start_time"]))
-        et = datetime.combine(dt, parse_time(r["end_time"]))
-        ics_lines.extend([
-            "BEGIN:VEVENT",
-            f"UID:{r['id']}@sala.local",
-            f"DTSTAMP:{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}",
-            f"DTSTART:{st.strftime('%Y%m%dT%H%M00')}",
-            f"DTEND:{et.strftime('%Y%m%dT%H%M00')}",
-            f"SUMMARY:{r['title']}",
-            f"DESCRIPTION:Reservado por {r['email']}",
-            "END:VEVENT",
-        ])
-    ics_lines.append("END:VCALENDAR")
-
-    content = "\r\n".join(ics_lines)
-    resp = make_response(content)
-    resp.headers["Content-Type"] = "text/calendar; charset=utf-8"
-    resp.headers["Content-Disposition"] = "attachment; filename=reservas_sala.ics"
-    return resp
-
-# URL estável para assinatura no Outlook (webcal/HTTPS)
-@app.get("/calendar.ics")
-def calendar_ics():
-    return export_ics()
-
-# URL com token (opcional) para segmentar acesso
-@app.get("/calendar/<token>.ics")
-def calendar_ics_token(token: str):
-    if ICS_TOKEN and token != ICS_TOKEN:
-        return abort(403)
-    return export_ics()
-
-# --- Exclusão com verificação de autoria (e-mail deve bater com o criador) ---
 @app.post("/delete/<int:event_id>")
 def delete_event(event_id: int):
     email_req = (request.form.get("email") or "").strip().lower()
-
     data = _read_all()
     events = data["events"]
     found = next((ev for ev in events if ev["id"] == event_id), None)
@@ -274,9 +219,8 @@ def delete_event(event_id: int):
         flash("Evento não encontrado.", "error")
         return redirect(url_for("index"))
 
-    email_owner = (found["email"] or "").strip().lower()
-    if email_req != email_owner:
-        flash("Apenas quem criou o evento pode excluir (e-mail não confere).", "error")
+    if email_req != (found["email"] or "").strip().lower():
+        flash("E-mail não confere para exclusão.", "error")
         return redirect(url_for("index"))
 
     data["events"] = [ev for ev in events if ev["id"] != event_id]
@@ -284,9 +228,8 @@ def delete_event(event_id: int):
     flash("Evento excluído.", "success")
     return redirect(url_for("index"))
 
-# --- Template (paleta estilo Correios + crédito) + formulário de Alterar ---
-TEMPLATE_INDEX = r"""
-<!doctype html>
+# --- Template HTML + Ticker ---
+TEMPLATE_INDEX = r"""<!doctype html>
 <html lang="pt-br">
 <head>
   <meta charset="utf-8">
@@ -294,72 +237,88 @@ TEMPLATE_INDEX = r"""
   <title>Reserva de Sala</title>
   <style>
     :root{
-      --brand-yellow:#FFD100;   /* destaque/CTA */
-      --brand-blue:#003399;     /* institucional */
-      --blue-700:#0055A5;       /* apoio/hover */
-      --bg:#F5F7FA;             /* fundo app */
-      --panel:#FFFFFF;          /* painéis/cartões */
-      --text:#1F2937;           /* texto primário */
-      --muted:#6B7280;          /* texto secundário */
-      --border:#E5E7EB;         /* bordas sutis */
-      --today:#0055A5;          /* destaque dia atual */
-      --event-bg:#E6EDFF;       /* chip de evento */
+      --brand-yellow:#FFD100;
+      --brand-blue:#003399;
+      --blue-700:#0055A5;
+      --bg:#F5F7FA;
+      --panel:#FFFFFF;
+      --text:#1F2937;
+      --muted:#6B7280;
+      --border:#E5E7EB;
+      --today:#0055A5;
+      --event-bg:#E6EDFF;
       --event-border:#B3C6FF;
-      --warn:#F59E0B;           /* avisos */
+      --warn:#F59E0B;
     }
-
     *{box-sizing:border-box}
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,Helvetica,Arial;background:var(--bg);color:var(--text);margin:0;}
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,Helvetica,Arial;background:var(--bg);color:var(--text);margin:0;padding-bottom:40px;}
     .container{max-width:1100px;margin:0 auto;padding:24px;}
     h1{margin:0 0 16px 0;font-size:28px;color:var(--brand-blue);}
-
     .topbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px;}
     .panel{background:var(--panel);border-radius:16px;padding:14px;border:1px solid var(--border);}
-
     .actions{display:flex;gap:8px;align-items:center}
     button,.btn{cursor:pointer;border:none;border-radius:10px;padding:10px 14px;font-weight:700;transition:transform .02s ease, box-shadow .2s ease;}
     button:active{transform:scale(.99)}
     button.primary{background:var(--brand-blue);color:#fff;}
     button.primary:hover{background:var(--blue-700);}
-    button.accent{background:var(--brand-yellow);color:#1f2937;}
-    button.accent:hover{filter:brightness(0.95);}
     button.warn{background:var(--warn);color:#111827;}
-
     input{border-radius:10px;border:1px solid var(--border);background:#FFF;color:var(--text);padding:10px 12px;font-size:14px;}
     input[type="date"],input[type="time"]{padding:8px 10px;}
-
     .weekday{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:8px 0;}
-
     .grid{display:grid;grid-template-columns:repeat(7,1fr);gap:8px;}
     .day{background:var(--panel);border:1px solid var(--border);border-radius:14px;min-height:120px;padding:8px;display:flex;flex-direction:column;}
     .day.today{outline:3px solid var(--today);outline-offset:1px;}
     .day .head{display:flex;justify-content:space-between;align-items:center;font-size:12px;color:var(--muted);}
     .day .num{font-weight:700;font-size:14px;color:var(--brand-blue);}
-
     .events{margin-top:6px;display:flex;flex-direction:column;gap:6px;overflow-y:auto}
     .event{background:var(--event-bg);border:1px solid var(--event-border);padding:6px 8px;border-radius:10px;font-size:12px;}
     .event .time{opacity:.85}
-
     .msg{padding:10px 12px;border-radius:10px;margin-bottom:8px;font-size:14px;}
     .msg.error{background:#FEF2F2;border:1px solid #FCA5A5;color:#991B1B;}
     .msg.success{background:#F0FDF4;border:1px solid #86EFAC;color:#14532D;}
-
     .footer{font-size:12px;color:var(--muted);margin-top:12px}
     .muted{opacity:.6}
     form.inline{display:inline;}
     a.btnlink{text-decoration:none;}
-
     details{margin-top:6px;}
     details .editbox{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;}
     details .editbox input{font-size:12px;padding:6px 8px;}
     details .editbox button{padding:8px 10px;}
     summary{cursor:pointer;user-select:none;}
+    /* ====== Ticker de Notícias ====== */
+    .ticker-container {
+        position: fixed;
+        bottom: 0;
+        width: 100%;
+        background-color: #0056b3;
+        color: white;
+        font-size: 1.1em;
+        overflow: hidden;
+        white-space: nowrap;
+        z-index: 9999;
+    }
+    .ticker {
+        display: inline-block;
+        padding-left: 100%;
+        animation: scroll 60s linear infinite;
+    }
+    @keyframes scroll {
+        from { transform: translateX(0); }
+        to   { transform: translateX(-100%); }
+    }
+    .ticker a {
+        color: white;
+        text-decoration: none;
+        margin-right: 50px;
+    }
+    .ticker a:hover {
+        text-decoration: underline;
+    }
   </style>
 </head>
 <body>
   <div class="container">
     <h1>Reserva de Sala de Reunião</h1>
-
     <div class="panel topbar">
       <div class="actions">
         <form method="get" action="/">
@@ -379,11 +338,8 @@ TEMPLATE_INDEX = r"""
           <button class="primary" name="year" value="{{ today.year }}" formaction="/" formmethod="get">Hoje</button>
           <input type="hidden" name="month" value="{{ today.month }}"/>
         </form>
-        <a class="btnlink" href="/calendar.ics"><button type="button" class="accent">Assinar .ics</button></a>
-        <a class="btnlink" href="/export.ics"><button type="button" class="accent">Exportar .ics</button></a>
       </div>
     </div>
-
     {% with messages = get_flashed_messages(with_categories=true) %}
       {% if messages %}
       <div>
@@ -393,7 +349,6 @@ TEMPLATE_INDEX = r"""
       </div>
       {% endif %}
     {% endwith %}
-
     <div class="panel" style="margin-bottom:14px;">
       <form method="post" action="/add">
         <div style="display:flex; gap:12px; flex-wrap:wrap;">
@@ -409,7 +364,6 @@ TEMPLATE_INDEX = r"""
         Janela de agendamento: <strong>{{ wstart }}–{{ wend }}</strong>. Conflitos são bloqueados automaticamente.
       </div>
     </div>
-
     <div class="weekday">Seg • Ter • Qua • Qui • Sex • Sáb • Dom</div>
     <div class="grid">
       {% for week in weeks %}
@@ -430,16 +384,12 @@ TEMPLATE_INDEX = r"""
                   <div class="event">
                     <div><strong>{{ ev['title'] }}</strong></div>
                     <div class="time">{{ ev['start_time'] }}–{{ ev['end_time'] }}</div>
-
-                    <!-- Excluir -->
                     <form class="inline" method="post" action="/delete/{{ ev['id'] }}" onsubmit="return confirm('Excluir este evento?');">
                       <input type="email" name="email" placeholder="Seu e-mail" required
                              style="border:1px solid var(--border); background:#FFF; color:var(--text);
                                     padding:6px 8px; border-radius:8px; font-size:12px; margin-right:6px; width:160px;">
                       <button type="submit" class="warn">Excluir</button>
                     </form>
-
-                    <!-- Alterar -->
                     <details>
                       <summary>Alterar</summary>
                       <form class="editbox" method="post" action="/edit/{{ ev['id'] }}">
@@ -461,14 +411,37 @@ TEMPLATE_INDEX = r"""
         {% endfor %}
       {% endfor %}
     </div>
-
-    <div class="footer">Dica: assine o <em>.ics</em> no Outlook para sincronização automática.</div>
+    <div class="footer">Sistema interno de reservas.</div>
   </div>
 
-  <!-- Créditos institucionais -->
-  <div class="footer" style="text-align:center; margin:16px 0 24px;">
-    Desenvolvido por <strong>@ericvieira</strong>
+  <!-- === Ticker de Notícias InfoMoney === -->
+  <div class="ticker-container">
+      <div id="ticker" class="ticker"></div>
   </div>
+
+  <script>
+      async function fetchRSSForTicker() {
+          const url = 'https://www.infomoney.com.br/feed/';
+          const proxyUrl = `https://api.rss2json.com/v1/api.json?rss_url=${encodeURIComponent(url)}`;
+          try {
+              const response = await fetch(proxyUrl);
+              const data = await response.json();
+              const tickerContainer = document.getElementById('ticker');
+              tickerContainer.innerHTML = "";
+              data.items.forEach(item => {
+                  const newsLink = document.createElement('a');
+                  newsLink.href = item.link;
+                  newsLink.target = '_blank';
+                  newsLink.textContent = `${item.title} — `;
+                  tickerContainer.appendChild(newsLink);
+              });
+          } catch (error) {
+              console.error("Erro ao buscar o RSS:", error);
+          }
+      }
+      fetchRSSForTicker();
+      setInterval(fetchRSSForTicker, 60000);
+  </script>
 </body>
 </html>
 """
